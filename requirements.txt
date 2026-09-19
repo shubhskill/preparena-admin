@@ -1,0 +1,4 @@
+python-telegram-bot==22.5
+supabase==2.18.1
+python-dotenv==1.1.1
+bcrypt==4.3.0
