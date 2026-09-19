@@ -5,7 +5,7 @@ from typing import Optional
 import bcrypt
 from dotenv import load_dotenv
 from supabase import Client, create_client
-from telegram import ReplyKeyboardMarkup, Update
+from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -64,10 +64,7 @@ supabase: Client = create_client(
 # AUTHENTICATED SESSIONS
 # ============================================================
 
-# Telegram user IDs that successfully logged in.
 authenticated_users: set[int] = set()
-
-# Users currently being asked for a password.
 awaiting_password: set[int] = set()
 
 
@@ -78,7 +75,7 @@ awaiting_password: set[int] = set()
 OWNER_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["➕ Create Test", "📋 Manage Tests"],
-        ["🔑 Answer Keys", "🏆 Results"],
+        ["🏆 Results"],
         ["👥 Manage Admins"],
         ["🚪 Logout"],
     ],
@@ -88,7 +85,7 @@ OWNER_KEYBOARD = ReplyKeyboardMarkup(
 ADMIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["➕ Create Test", "📋 Manage Tests"],
-        ["🔑 Answer Keys", "🏆 Results"],
+        ["🏆 Results"],
         ["🚪 Logout"],
     ],
     resize_keyboard=True,
@@ -224,7 +221,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not admin:
         await update.message.reply_text(
             "❌ Access Denied.\n\n"
-            "You are not registered as a PrepArena Owner or Admin."
+            "You are not registered as a PrepArena Owner or Admin.",
+            reply_markup=ReplyKeyboardRemove(),
         )
         return
 
@@ -238,7 +236,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(
         f"🔐 PrepArena {role_text} Login\n\n"
-        "Please enter your password."
+        "Please enter your password.",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
 
@@ -261,7 +260,6 @@ async def handle_password(update: Update) -> None:
 
     password = update.message.text
 
-    # Remove login state immediately.
     awaiting_password.discard(telegram_user_id)
 
     try:
@@ -276,17 +274,16 @@ async def handle_password(update: Update) -> None:
 
     if not admin:
         await update.message.reply_text(
-            "❌ Access Denied."
+            "❌ Access Denied.",
+            reply_markup=ReplyKeyboardRemove(),
         )
         return
 
     authenticated = False
 
-    # Owner authentication uses Railway OWNER_PASSWORD.
     if admin["role"] == "OWNER":
         authenticated = password == OWNER_PASSWORD
 
-    # Normal Admin authentication uses bcrypt hash in Supabase.
     elif admin["role"] == "ADMIN":
         password_hash = admin.get("password_hash")
 
@@ -302,7 +299,8 @@ async def handle_password(update: Update) -> None:
     if not authenticated:
         await update.message.reply_text(
             "❌ Incorrect password.\n\n"
-            "Use /start to try again."
+            "Use /start to try again.",
+            reply_markup=ReplyKeyboardRemove(),
         )
         return
 
@@ -317,7 +315,6 @@ async def handle_password(update: Update) -> None:
         "✅ Login successful."
     )
 
-    # Refresh admin data after login.
     try:
         admin = get_admin_by_telegram_id(telegram_user_id)
     except Exception:
@@ -331,7 +328,7 @@ async def handle_password(update: Update) -> None:
 # ============================================================
 
 async def logout(update: Update) -> None:
-    """Log the current admin out."""
+    """Log the current admin out and remove the dashboard keyboard."""
     telegram_user_id = get_telegram_user_id(update)
 
     if telegram_user_id is None:
@@ -341,8 +338,8 @@ async def logout(update: Update) -> None:
     awaiting_password.discard(telegram_user_id)
 
     await update.message.reply_text(
-        "🚪 You have been logged out.\n\n"
-        "Use /start whenever you want to log in again."
+        "🚪 You have been logged out.",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
 
@@ -366,7 +363,6 @@ async def handle_dashboard_message(
     if telegram_user_id is None:
         return
 
-    # Password input must be processed before dashboard buttons.
     if telegram_user_id in awaiting_password:
         await handle_password(update)
         return
@@ -382,13 +378,10 @@ async def handle_dashboard_message(
     if not admin:
         await update.message.reply_text(
             "🔐 You are not logged in.\n\n"
-            "Use /start to log in."
+            "Use /start to log in.",
+            reply_markup=ReplyKeyboardRemove(),
         )
         return
-
-    # --------------------------------------------------------
-    # These features will be implemented in later phases.
-    # --------------------------------------------------------
 
     if text == "➕ Create Test":
         await update.message.reply_text(
@@ -401,13 +394,6 @@ async def handle_dashboard_message(
         await update.message.reply_text(
             "📋 Manage Tests\n\n"
             "Test management module will be added next."
-        )
-        return
-
-    if text == "🔑 Answer Keys":
-        await update.message.reply_text(
-            "🔑 Answer Keys\n\n"
-            "Answer-key module will be added later."
         )
         return
 
