@@ -34,6 +34,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 OWNER_PASSWORD = os.getenv("OWNER_PASSWORD")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
@@ -46,6 +47,9 @@ if not SUPABASE_SERVICE_ROLE_KEY:
 
 if not OWNER_PASSWORD:
     raise RuntimeError("OWNER_PASSWORD is missing")
+
+if not ADMIN_PASSWORD:
+    raise RuntimeError("ADMIN_PASSWORD is missing")
 
 
 # ============================================================
@@ -71,11 +75,16 @@ supabase: Client = create_client(
 
 
 # ============================================================
-# IN-MEMORY AUTHENTICATION
+# AUTHENTICATION
 # ============================================================
 
-authenticated_users: set[int] = set()
-awaiting_password: set[int] = set()
+# Stores:
+# telegram_user_id -> "OWNER" or "ADMIN"
+authenticated_users: dict[int, str] = {}
+
+# Users currently being asked for a password.
+# Value is either "OWNER" or "ADMIN".
+awaiting_password: dict[int, str] = {}
 
 
 # ============================================================
@@ -103,6 +112,22 @@ awaiting_password: set[int] = set()
 # KEYBOARDS
 # ============================================================
 
+ACCESS_TYPE_KEYBOARD = InlineKeyboardMarkup(
+    [
+        [
+            InlineKeyboardButton(
+                "👑 Owner",
+                callback_data="login_owner",
+            ),
+            InlineKeyboardButton(
+                "🛡️ Admin",
+                callback_data="login_admin",
+            ),
+        ]
+    ]
+)
+
+
 OWNER_DASHBOARD = ReplyKeyboardMarkup(
     [
         ["➕ Create Test", "📋 Manage Tests"],
@@ -115,7 +140,8 @@ OWNER_DASHBOARD = ReplyKeyboardMarkup(
 ADMIN_DASHBOARD = ReplyKeyboardMarkup(
     [
         ["➕ Create Test", "📋 Manage Tests"],
-        ["🏆 Results", "🚪 Logout"],
+        ["🏆 Results"],
+        ["🚪 Logout"],
     ],
     resize_keyboard=True,
 )
@@ -133,7 +159,6 @@ CANCEL_KEYBOARD = ReplyKeyboardMarkup(
 # ============================================================
 
 def is_private_chat(update: Update) -> bool:
-    """Only allow private chats."""
     return (
         update.effective_chat is not None
         and update.effective_chat.type == "private"
@@ -147,10 +172,42 @@ def get_telegram_user_id(update: Update) -> Optional[int]:
     return update.effective_user.id
 
 
-async def get_admin_by_telegram_id(
-    telegram_user_id: int,
+def get_authenticated_role(update: Update) -> Optional[str]:
+    telegram_user_id = get_telegram_user_id(update)
+
+    if telegram_user_id is None:
+        return None
+
+    return authenticated_users.get(telegram_user_id)
+
+
+def is_authenticated(update: Update) -> bool:
+    return get_authenticated_role(update) is not None
+
+
+def is_owner(update: Update) -> bool:
+    return get_authenticated_role(update) == "OWNER"
+
+
+def is_admin(update: Update) -> bool:
+    return get_authenticated_role(update) == "ADMIN"
+
+
+async def get_logged_in_database_user(
+    update: Update,
 ) -> Optional[dict]:
-    """Get active admin/owner record."""
+    """
+    Returns the database admin record for the current Telegram user.
+
+    Telegram ID is NOT used for password authentication.
+    It is only used here to identify the current session's database
+    record when an owner/admin performs actions.
+    """
+
+    telegram_user_id = get_telegram_user_id(update)
+
+    if telegram_user_id is None:
+        return None
 
     try:
         response = (
@@ -166,13 +223,18 @@ async def get_admin_by_telegram_id(
             return response.data[0]
 
     except Exception:
-        logger.exception("Failed to get admin")
+        logger.exception(
+            "Failed to get current database admin record"
+        )
 
     return None
 
 
 async def update_admin_profile(update: Update) -> None:
-    """Keep display name and username updated."""
+    """
+    Keep the current owner's/admin's display name and username
+    updated in the database when a matching record exists.
+    """
 
     telegram_user_id = get_telegram_user_id(update)
 
@@ -181,69 +243,75 @@ async def update_admin_profile(update: Update) -> None:
 
     user = update.effective_user
 
-    display_name = user.full_name if user else "Admin"
-    username = user.username if user else None
+    display_name = (
+        user.full_name
+        if user
+        else "PrepArena User"
+    )
+
+    username = (
+        user.username
+        if user
+        else None
+    )
 
     try:
-        supabase.table("admins").update(
-            {
-                "display_name": display_name,
-                "username": username,
-            }
-        ).eq(
-            "telegram_user_id",
-            telegram_user_id,
-        ).execute()
+        (
+            supabase.table("admins")
+            .update(
+                {
+                    "display_name": display_name,
+                    "username": username,
+                }
+            )
+            .eq(
+                "telegram_user_id",
+                telegram_user_id,
+            )
+            .execute()
+        )
 
     except Exception:
-        logger.exception("Failed to update admin profile")
-
-
-async def get_logged_in_admin(update: Update) -> Optional[dict]:
-    telegram_user_id = get_telegram_user_id(update)
-
-    if telegram_user_id is None:
-        return None
-
-    if telegram_user_id not in authenticated_users:
-        return None
-
-    return await get_admin_by_telegram_id(telegram_user_id)
+        # A database admin record is not required for login.
+        # Login itself is controlled by Railway passwords.
+        logger.exception(
+            "Failed to update profile information"
+        )
 
 
 async def send_dashboard(
     update: Update,
-    admin: Optional[dict] = None,
 ) -> None:
 
-    if admin is None:
-        admin = await get_logged_in_admin(update)
-
-    if not admin:
-        return
-
-    role = admin.get("role")
+    role = get_authenticated_role(update)
 
     if role == "OWNER":
-        keyboard = OWNER_DASHBOARD
-        role_text = "👑 OWNER"
-    else:
-        keyboard = ADMIN_DASHBOARD
-        role_text = "🛡 ADMIN"
 
-    await update.effective_message.reply_text(
-        f"🏟️ PrepArena Admin Panel\n\n"
-        f"Role: {role_text}\n\n"
-        f"Choose an option below.",
-        reply_markup=keyboard,
-    )
+        await update.effective_message.reply_text(
+            "🏟️ PrepArena Owner Panel\n\n"
+            "👑 Access: Owner\n\n"
+            "Choose an option below.",
+            reply_markup=OWNER_DASHBOARD,
+        )
+
+    elif role == "ADMIN":
+
+        await update.effective_message.reply_text(
+            "🏟️ PrepArena Admin Panel\n\n"
+            "🛡️ Access: Admin\n\n"
+            "Choose an option below.",
+            reply_markup=ADMIN_DASHBOARD,
+        )
 
 
 # ============================================================
-# START / LOGIN
+# START
 # ============================================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
 
     if not is_private_chat(update):
         return
@@ -253,33 +321,87 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if telegram_user_id is None:
         return
 
-    admin = await get_admin_by_telegram_id(telegram_user_id)
+    # If already logged in, don't ask for password again.
+    if telegram_user_id in authenticated_users:
 
-    if not admin:
-        await update.message.reply_text(
-            "⛔ You are not authorized to use the PrepArena Admin Bot."
-        )
+        await send_dashboard(update)
+
         return
 
-    await update_admin_profile(update)
+    # Clear any previous pending login choice.
+    awaiting_password.pop(
+        telegram_user_id,
+        None,
+    )
+
+    await update.message.reply_text(
+        "🏟️ Welcome to PrepArena Admin Bot.\n\n"
+        "Choose your access type:",
+        reply_markup=ACCESS_TYPE_KEYBOARD,
+    )
+
+
+# ============================================================
+# ACCESS TYPE SELECTION
+# ============================================================
+
+async def select_login_type(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    query = update.callback_query
+
+    if not query:
+        return
+
+    await query.answer()
+
+    telegram_user_id = get_telegram_user_id(update)
+
+    if telegram_user_id is None:
+        return
 
     if telegram_user_id in authenticated_users:
-        await send_dashboard(update, admin)
+
+        await query.message.reply_text(
+            "You are already logged in."
+        )
+
+        await send_dashboard(update)
+
         return
 
-    awaiting_password.add(telegram_user_id)
+    if query.data == "login_owner":
 
-    if admin.get("role") == "OWNER":
-        await update.message.reply_text(
-            "🔐 Owner authentication required.\n\n"
-            "Please enter the owner password."
-        )
-    else:
-        await update.message.reply_text(
-            "🔐 Admin authentication required.\n\n"
-            "Please enter your admin password."
+        awaiting_password[
+            telegram_user_id
+        ] = "OWNER"
+
+        await query.message.reply_text(
+            "👑 Owner Login\n\n"
+            "🔐 Enter the Owner Password:",
         )
 
+        return
+
+    if query.data == "login_admin":
+
+        awaiting_password[
+            telegram_user_id
+        ] = "ADMIN"
+
+        await query.message.reply_text(
+            "🛡️ Admin Login\n\n"
+            "🔐 Enter the Admin Password:",
+        )
+
+        return
+
+
+# ============================================================
+# PASSWORD LOGIN
+# ============================================================
 
 async def receive_password(
     update: Update,
@@ -294,7 +416,11 @@ async def receive_password(
     if telegram_user_id is None:
         return
 
-    if telegram_user_id not in awaiting_password:
+    login_type = awaiting_password.get(
+        telegram_user_id
+    )
+
+    if not login_type:
         return
 
     if not update.message or not update.message.text:
@@ -302,70 +428,73 @@ async def receive_password(
 
     password = update.message.text.strip()
 
-    admin = await get_admin_by_telegram_id(telegram_user_id)
-
-    if not admin:
-        awaiting_password.discard(telegram_user_id)
-
-        await update.message.reply_text(
-            "⛔ You are not authorized."
-        )
-        return
-
-    role = admin.get("role")
-
-    authenticated = False
-
     # --------------------------------------------------------
-    # OWNER LOGIN
+    # OWNER PASSWORD
     # --------------------------------------------------------
 
-    if role == "OWNER":
+    if login_type == "OWNER":
 
         if password == OWNER_PASSWORD:
-            authenticated = True
 
-    # --------------------------------------------------------
-    # ADMIN LOGIN
-    # --------------------------------------------------------
+            authenticated_users[
+                telegram_user_id
+            ] = "OWNER"
 
-    elif role == "ADMIN":
+            awaiting_password.pop(
+                telegram_user_id,
+                None,
+            )
 
-        password_hash = admin.get("password_hash")
+            await update_admin_profile(update)
 
-        if password_hash:
+            await update.message.reply_text(
+                "✅ Owner login successful."
+            )
 
-            try:
-                authenticated = bcrypt.checkpw(
-                    password.encode("utf-8"),
-                    password_hash.encode("utf-8"),
-                )
-            except Exception:
-                logger.exception("Admin password verification failed")
+            await send_dashboard(update)
 
-    # --------------------------------------------------------
-    # RESULT
-    # --------------------------------------------------------
-
-    if authenticated:
-
-        authenticated_users.add(telegram_user_id)
-        awaiting_password.discard(telegram_user_id)
-
-        await update_admin_profile(update)
+            return
 
         await update.message.reply_text(
-            "✅ Login successful."
-        )
-
-        await send_dashboard(update, admin)
-
-    else:
-
-        await update.message.reply_text(
-            "❌ Incorrect password.\n\n"
+            "❌ Incorrect Owner Password.\n\n"
             "Please try again."
         )
+
+        return
+
+    # --------------------------------------------------------
+    # ADMIN PASSWORD
+    # --------------------------------------------------------
+
+    if login_type == "ADMIN":
+
+        if password == ADMIN_PASSWORD:
+
+            authenticated_users[
+                telegram_user_id
+            ] = "ADMIN"
+
+            awaiting_password.pop(
+                telegram_user_id,
+                None,
+            )
+
+            await update_admin_profile(update)
+
+            await update.message.reply_text(
+                "✅ Admin login successful."
+            )
+
+            await send_dashboard(update)
+
+            return
+
+        await update.message.reply_text(
+            "❌ Incorrect Admin Password.\n\n"
+            "Please try again."
+        )
+
+        return
 
 
 # ============================================================
@@ -385,10 +514,16 @@ async def logout(
     if telegram_user_id is None:
         return
 
-    authenticated_users.discard(telegram_user_id)
-    awaiting_password.discard(telegram_user_id)
+    authenticated_users.pop(
+        telegram_user_id,
+        None,
+    )
 
-    # Remove any unfinished create-test conversation data.
+    awaiting_password.pop(
+        telegram_user_id,
+        None,
+    )
+
     context.user_data.clear()
 
     await update.message.reply_text(
@@ -401,24 +536,28 @@ async def logout(
 # CREATE TEST HELPERS
 # ============================================================
 
-async def delete_draft_test(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Delete the draft test created during the current conversation.
+async def delete_draft_test(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
 
-    Because questions/options/etc. use ON DELETE CASCADE,
-    related data is removed automatically.
-    """
-
-    test_id = context.user_data.get("create_test_id")
+    test_id = context.user_data.get(
+        "create_test_id"
+    )
 
     if not test_id:
         return
 
     try:
-        supabase.table("tests").delete().eq(
-            "id",
-            test_id,
-        ).execute()
+
+        (
+            supabase.table("tests")
+            .delete()
+            .eq(
+                "id",
+                test_id,
+            )
+            .execute()
+        )
 
         logger.info(
             "Deleted cancelled draft test %s",
@@ -454,7 +593,10 @@ def clear_create_test_data(
     ]
 
     for key in keys:
-        context.user_data.pop(key, None)
+        context.user_data.pop(
+            key,
+            None,
+        )
 
 
 async def cancel_create_test(
@@ -462,19 +604,22 @@ async def cancel_create_test(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
 
-    await delete_draft_test(context)
+    await delete_draft_test(
+        context
+    )
 
-    clear_create_test_data(context)
+    clear_create_test_data(
+        context
+    )
 
     await update.effective_message.reply_text(
         "❌ Create Test cancelled.\n\n"
         "Any unfinished draft created during this process has been removed."
     )
 
-    admin = await get_logged_in_admin(update)
-
-    if admin:
-        await send_dashboard(update, admin)
+    await send_dashboard(
+        update
+    )
 
     return ConversationHandler.END
 
@@ -488,15 +633,19 @@ async def begin_create_test(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
 
-    admin = await get_logged_in_admin(update)
+    role = get_authenticated_role(update)
 
-    if not admin:
+    if role not in ("OWNER", "ADMIN"):
+
         await update.message.reply_text(
             "⛔ Please login first."
         )
+
         return ConversationHandler.END
 
-    clear_create_test_data(context)
+    clear_create_test_data(
+        context
+    )
 
     await update.message.reply_text(
         "➕ Create Test\n\n"
@@ -525,30 +674,38 @@ async def receive_test_name(
     text = update.message.text.strip()
 
     if text == "❌ Cancel":
-        return await cancel_create_test(update, context)
+        return await cancel_create_test(
+            update,
+            context,
+        )
 
     if not text:
+
         await update.message.reply_text(
             "❌ Test name cannot be empty.\n\n"
             "Please enter the test name."
         )
+
         return CREATE_TEST_NAME
 
     if len(text) > 200:
+
         await update.message.reply_text(
             "❌ Test name is too long.\n\n"
             "Please keep it under 200 characters."
         )
+
         return CREATE_TEST_NAME
 
-    context.user_data["create_test_name"] = text
+    context.user_data[
+        "create_test_name"
+    ] = text
 
     await update.message.reply_text(
         "Step 2/2\n\n"
         "Enter the test description.\n\n"
-        "You can write what this test is about.\n\n"
         "Example:\n"
-        "JEE Main level Physics, Chemistry and Mathematics mock test."
+        "JEE Main level mock test."
     )
 
     return CREATE_TEST_DESCRIPTION
@@ -569,40 +726,63 @@ async def receive_test_description(
     text = update.message.text.strip()
 
     if text == "❌ Cancel":
-        return await cancel_create_test(update, context)
+        return await cancel_create_test(
+            update,
+            context,
+        )
 
     if not text:
+
         await update.message.reply_text(
             "❌ Description cannot be empty.\n\n"
             "Please enter the test description."
         )
+
         return CREATE_TEST_DESCRIPTION
 
     if len(text) > 4000:
+
         await update.message.reply_text(
             "❌ Description is too long.\n\n"
             "Please keep it under 4000 characters."
         )
+
         return CREATE_TEST_DESCRIPTION
 
-    context.user_data["create_test_description"] = text
+    context.user_data[
+        "create_test_description"
+    ] = text
 
-    telegram_user_id = get_telegram_user_id(update)
+    telegram_user_id = get_telegram_user_id(
+        update
+    )
 
     if telegram_user_id is None:
         return ConversationHandler.END
 
-    admin = await get_admin_by_telegram_id(telegram_user_id)
+    # --------------------------------------------------------
+    # Find database creator record if available.
+    #
+    # Existing database schema has created_by as FK.
+    # The current owner record was already bootstrapped.
+    # For other admin users, their Telegram account can be
+    # represented in the admins table if needed.
+    # --------------------------------------------------------
 
-    if not admin:
+    database_admin = await get_logged_in_database_user(
+        update
+    )
+
+    if not database_admin:
+
         await update.message.reply_text(
-            "⛔ Admin account not found."
+            "❌ Your login is valid, but your database admin "
+            "record could not be found.\n\n"
+            "Please make sure the current admin/owner record "
+            "exists in Supabase before creating tests."
         )
-        return ConversationHandler.END
 
-    # --------------------------------------------------------
-    # CREATE DRAFT TEST
-    # --------------------------------------------------------
+        return ConversationHandler.END
 
     try:
 
@@ -610,26 +790,42 @@ async def receive_test_description(
             supabase.table("tests")
             .insert(
                 {
-                    "name": context.user_data["create_test_name"],
+                    "name": context.user_data[
+                        "create_test_name"
+                    ],
                     "description": text,
                     "status": "DRAFT",
-                    "created_by": admin["id"],
+                    "created_by": database_admin["id"],
                 }
             )
             .execute()
         )
 
         if not response.data:
-            raise RuntimeError("Supabase did not return created test.")
+
+            raise RuntimeError(
+                "Supabase did not return created test."
+            )
 
         test = response.data[0]
 
-        context.user_data["create_test_id"] = test["id"]
-        context.user_data["question_count"] = 0
-        context.user_data["total_marks"] = 0.0
+        context.user_data[
+            "create_test_id"
+        ] = test["id"]
+
+        context.user_data[
+            "question_count"
+        ] = 0
+
+        context.user_data[
+            "total_marks"
+        ] = 0.0
 
     except Exception:
-        logger.exception("Failed to create draft test")
+
+        logger.exception(
+            "Failed to create draft test"
+        )
 
         await update.message.reply_text(
             "❌ Could not create the test.\n\n"
@@ -664,23 +860,32 @@ async def receive_question_text(
     text = update.message.text.strip()
 
     if text == "❌ Cancel":
-        return await cancel_create_test(update, context)
+        return await cancel_create_test(
+            update,
+            context,
+        )
 
     if not text:
+
         await update.message.reply_text(
             "❌ Question text cannot be empty.\n\n"
             "Please send the question text."
         )
+
         return QUESTION_TEXT
 
     if len(text) > 8000:
+
         await update.message.reply_text(
             "❌ Question is too long.\n\n"
             "Please keep it under 8000 characters."
         )
+
         return QUESTION_TEXT
 
-    context.user_data["current_question_text"] = text
+    context.user_data[
+        "current_question_text"
+    ] = text
 
     keyboard = InlineKeyboardMarkup(
         [
@@ -727,23 +932,26 @@ async def receive_question_type(
 
     await query.answer()
 
-    data = query.data
-
-    if data == "qtype_mcq":
+    if query.data == "qtype_mcq":
         question_type = "MCQ"
 
-    elif data == "qtype_multi":
+    elif query.data == "qtype_multi":
         question_type = "MULTIPLE_CORRECT"
 
-    elif data == "qtype_numeric":
+    elif query.data == "qtype_numeric":
         question_type = "NUMERICAL"
 
     else:
         return QUESTION_TYPE
 
-    context.user_data["current_question_type"] = question_type
+    context.user_data[
+        "current_question_type"
+    ] = question_type
 
-    if question_type in ("MCQ", "MULTIPLE_CORRECT"):
+    if question_type in (
+        "MCQ",
+        "MULTIPLE_CORRECT",
+    ):
 
         await query.message.reply_text(
             "Enter option A:",
@@ -761,7 +969,7 @@ async def receive_question_type(
 
 
 # ============================================================
-# QUESTION - OPTION A
+# OPTION A
 # ============================================================
 
 async def receive_option_a(
@@ -775,22 +983,30 @@ async def receive_option_a(
     text = update.message.text.strip()
 
     if text == "❌ Cancel":
-        return await cancel_create_test(update, context)
+        return await cancel_create_test(
+            update,
+            context,
+        )
 
     if not text:
+
         await update.message.reply_text(
-            "❌ Option A cannot be empty.\n\n"
-            "Please enter option A."
+            "❌ Option A cannot be empty."
         )
+
         return OPTION_A
 
     if len(text) > 2000:
+
         await update.message.reply_text(
             "❌ Option A is too long."
         )
+
         return OPTION_A
 
-    context.user_data["current_option_a"] = text
+    context.user_data[
+        "current_option_a"
+    ] = text
 
     await update.message.reply_text(
         "Enter option B:"
@@ -800,7 +1016,7 @@ async def receive_option_a(
 
 
 # ============================================================
-# QUESTION - OPTION B
+# OPTION B
 # ============================================================
 
 async def receive_option_b(
@@ -814,22 +1030,30 @@ async def receive_option_b(
     text = update.message.text.strip()
 
     if text == "❌ Cancel":
-        return await cancel_create_test(update, context)
+        return await cancel_create_test(
+            update,
+            context,
+        )
 
     if not text:
+
         await update.message.reply_text(
-            "❌ Option B cannot be empty.\n\n"
-            "Please enter option B."
+            "❌ Option B cannot be empty."
         )
+
         return OPTION_B
 
     if len(text) > 2000:
+
         await update.message.reply_text(
             "❌ Option B is too long."
         )
+
         return OPTION_B
 
-    context.user_data["current_option_b"] = text
+    context.user_data[
+        "current_option_b"
+    ] = text
 
     await update.message.reply_text(
         "Enter option C:"
@@ -839,7 +1063,7 @@ async def receive_option_b(
 
 
 # ============================================================
-# QUESTION - OPTION C
+# OPTION C
 # ============================================================
 
 async def receive_option_c(
@@ -853,22 +1077,30 @@ async def receive_option_c(
     text = update.message.text.strip()
 
     if text == "❌ Cancel":
-        return await cancel_create_test(update, context)
+        return await cancel_create_test(
+            update,
+            context,
+        )
 
     if not text:
+
         await update.message.reply_text(
-            "❌ Option C cannot be empty.\n\n"
-            "Please enter option C."
+            "❌ Option C cannot be empty."
         )
+
         return OPTION_C
 
     if len(text) > 2000:
+
         await update.message.reply_text(
             "❌ Option C is too long."
         )
+
         return OPTION_C
 
-    context.user_data["current_option_c"] = text
+    context.user_data[
+        "current_option_c"
+    ] = text
 
     await update.message.reply_text(
         "Enter option D:"
@@ -878,7 +1110,7 @@ async def receive_option_c(
 
 
 # ============================================================
-# QUESTION - OPTION D
+# OPTION D
 # ============================================================
 
 async def receive_option_d(
@@ -892,22 +1124,30 @@ async def receive_option_d(
     text = update.message.text.strip()
 
     if text == "❌ Cancel":
-        return await cancel_create_test(update, context)
+        return await cancel_create_test(
+            update,
+            context,
+        )
 
     if not text:
+
         await update.message.reply_text(
-            "❌ Option D cannot be empty.\n\n"
-            "Please enter option D."
+            "❌ Option D cannot be empty."
         )
+
         return OPTION_D
 
     if len(text) > 2000:
+
         await update.message.reply_text(
             "❌ Option D is too long."
         )
+
         return OPTION_D
 
-    context.user_data["current_option_d"] = text
+    context.user_data[
+        "current_option_d"
+    ] = text
 
     await update.message.reply_text(
         "Enter the marks for this question.\n\n"
@@ -932,31 +1172,43 @@ async def receive_question_marks(
     text = update.message.text.strip()
 
     if text == "❌ Cancel":
-        return await cancel_create_test(update, context)
+        return await cancel_create_test(
+            update,
+            context,
+        )
 
     try:
         marks = float(text)
+
     except ValueError:
+
         await update.message.reply_text(
             "❌ Invalid marks.\n\n"
             "Please enter a number.\n"
             "Example: 4"
         )
+
         return QUESTION_MARKS
 
     if marks <= 0:
+
         await update.message.reply_text(
             "❌ Marks must be greater than 0."
         )
+
         return QUESTION_MARKS
 
     if marks > 100000:
+
         await update.message.reply_text(
             "❌ Marks value is too large."
         )
+
         return QUESTION_MARKS
 
-    context.user_data["current_question_marks"] = marks
+    context.user_data[
+        "current_question_marks"
+    ] = marks
 
     await update.message.reply_text(
         "Enter negative marks.\n\n"
@@ -983,32 +1235,43 @@ async def receive_question_negative_marks(
     text = update.message.text.strip()
 
     if text == "❌ Cancel":
-        return await cancel_create_test(update, context)
+        return await cancel_create_test(
+            update,
+            context,
+        )
 
     try:
         negative_marks = float(text)
+
     except ValueError:
+
         await update.message.reply_text(
             "❌ Invalid negative marks.\n\n"
             "Please enter a number.\n\n"
             "Use 0 if there is no negative marking."
         )
+
         return QUESTION_NEGATIVE_MARKS
 
     if negative_marks < 0:
+
         await update.message.reply_text(
-            "❌ Negative marks cannot be below 0.\n\n"
-            "Example: 1"
+            "❌ Negative marks cannot be below 0."
         )
+
         return QUESTION_NEGATIVE_MARKS
 
     if negative_marks > 100000:
+
         await update.message.reply_text(
             "❌ Negative marks value is too large."
         )
+
         return QUESTION_NEGATIVE_MARKS
 
-    context.user_data["current_question_negative_marks"] = negative_marks
+    context.user_data[
+        "current_question_negative_marks"
+    ] = negative_marks
 
     keyboard = InlineKeyboardMarkup(
         [
@@ -1061,7 +1324,9 @@ async def receive_photo_choice(
 
     if query.data == "photo_no":
 
-        context.user_data["current_question_photo_file_id"] = None
+        context.user_data[
+            "current_question_photo_file_id"
+        ] = None
 
         return await save_current_question_after_photo(
             query.message,
@@ -1084,16 +1349,19 @@ async def receive_question_photo(
         return QUESTION_PHOTO
 
     if not update.message.photo:
+
         await update.message.reply_text(
             "❌ Please send a photo.\n\n"
             "If you want to cancel the test creation, press ❌ Cancel."
         )
+
         return QUESTION_PHOTO
 
-    # Highest resolution Telegram photo.
     photo = update.message.photo[-1]
 
-    context.user_data["current_question_photo_file_id"] = photo.file_id
+    context.user_data[
+        "current_question_photo_file_id"
+    ] = photo.file_id
 
     await update.message.reply_text(
         "✅ Photo received successfully."
@@ -1106,7 +1374,7 @@ async def receive_question_photo(
 
 
 # ============================================================
-# SAVE CURRENT QUESTION
+# SAVE QUESTION
 # ============================================================
 
 async def save_current_question_after_photo(
@@ -1114,13 +1382,17 @@ async def save_current_question_after_photo(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
 
-    test_id = context.user_data.get("create_test_id")
+    test_id = context.user_data.get(
+        "create_test_id"
+    )
 
     if not test_id:
+
         await message.reply_text(
             "❌ Test draft was not found.\n\n"
             "Please start Create Test again."
         )
+
         return ConversationHandler.END
 
     question_text = context.user_data.get(
@@ -1144,13 +1416,15 @@ async def save_current_question_after_photo(
     )
 
     if not question_text or not question_type:
+
         await message.reply_text(
             "❌ Question information is incomplete."
         )
+
         return ConversationHandler.END
 
     # --------------------------------------------------------
-    # DETERMINE QUESTION NUMBER
+    # QUESTION NUMBER
     # --------------------------------------------------------
 
     try:
@@ -1158,7 +1432,10 @@ async def save_current_question_after_photo(
         existing_questions = (
             supabase.table("questions")
             .select("question_number")
-            .eq("test_id", test_id)
+            .eq(
+                "test_id",
+                test_id,
+            )
             .order(
                 "question_number",
                 desc=True,
@@ -1168,13 +1445,20 @@ async def save_current_question_after_photo(
         )
 
         if existing_questions.data:
+
             question_number = (
-                existing_questions.data[0]["question_number"] + 1
+                existing_questions.data[0][
+                    "question_number"
+                ]
+                + 1
             )
+
         else:
+
             question_number = 1
 
     except Exception:
+
         logger.exception(
             "Failed to determine question number"
         )
@@ -1185,13 +1469,13 @@ async def save_current_question_after_photo(
 
         return ConversationHandler.END
 
-    # --------------------------------------------------------
-    # INSERT QUESTION
-    # --------------------------------------------------------
-
     question_id = None
 
     try:
+
+        # ----------------------------------------------------
+        # INSERT QUESTION
+        # ----------------------------------------------------
 
         question_response = (
             supabase.table("questions")
@@ -1210,6 +1494,7 @@ async def save_current_question_after_photo(
         )
 
         if not question_response.data:
+
             raise RuntimeError(
                 "Supabase did not return created question."
             )
@@ -1260,24 +1545,34 @@ async def save_current_question_after_photo(
                 },
             ]
 
-            supabase.table("question_options").insert(
-                options
-            ).execute()
+            (
+                supabase.table("question_options")
+                .insert(options)
+                .execute()
+            )
 
     except Exception:
+
         logger.exception(
             "Failed to save question"
         )
 
-        # If question was inserted but options failed,
-        # delete the question. Options cascade automatically.
         if question_id:
+
             try:
-                supabase.table("questions").delete().eq(
-                    "id",
-                    question_id,
-                ).execute()
+
+                (
+                    supabase.table("questions")
+                    .delete()
+                    .eq(
+                        "id",
+                        question_id,
+                    )
+                    .execute()
+                )
+
             except Exception:
+
                 logger.exception(
                     "Failed to clean up incomplete question"
                 )
@@ -1290,7 +1585,7 @@ async def save_current_question_after_photo(
         return ConversationHandler.END
 
     # --------------------------------------------------------
-    # UPDATE LOCAL SUMMARY
+    # UPDATE SUMMARY
     # --------------------------------------------------------
 
     question_count = int(
@@ -1310,11 +1605,16 @@ async def save_current_question_after_photo(
     question_count += 1
     total_marks += float(marks)
 
-    context.user_data["question_count"] = question_count
-    context.user_data["total_marks"] = total_marks
+    context.user_data[
+        "question_count"
+    ] = question_count
+
+    context.user_data[
+        "total_marks"
+    ] = total_marks
 
     # --------------------------------------------------------
-    # CLEAR CURRENT QUESTION
+    # CLEAR CURRENT QUESTION DATA
     # --------------------------------------------------------
 
     current_question_keys = [
@@ -1330,10 +1630,14 @@ async def save_current_question_after_photo(
     ]
 
     for key in current_question_keys:
-        context.user_data.pop(key, None)
+
+        context.user_data.pop(
+            key,
+            None,
+        )
 
     # --------------------------------------------------------
-    # ASK NEXT ACTION
+    # NEXT ACTION
     # --------------------------------------------------------
 
     keyboard = InlineKeyboardMarkup(
@@ -1410,10 +1714,12 @@ async def after_question_action(
 
 
 # ============================================================
-# FORMAT NUMBERS
+# FORMAT NUMBER
 # ============================================================
 
-def format_number(value: float) -> str:
+def format_number(
+    value: float,
+) -> str:
 
     if float(value).is_integer():
         return str(int(value))
@@ -1430,12 +1736,16 @@ async def finish_create_test(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
 
-    test_id = context.user_data.get("create_test_id")
+    test_id = context.user_data.get(
+        "create_test_id"
+    )
 
     if not test_id:
+
         await message.reply_text(
             "❌ Test draft was not found."
         )
+
         return ConversationHandler.END
 
     question_count = int(
@@ -1445,17 +1755,11 @@ async def finish_create_test(
         )
     )
 
-    total_marks = float(
-        context.user_data.get(
-            "total_marks",
-            0.0,
-        )
-    )
-
     if question_count <= 0:
 
         await message.reply_text(
-            "❌ You cannot finish a test without adding at least one question.\n\n"
+            "❌ You cannot finish a test without "
+            "adding at least one question.\n\n"
             "Add a question first."
         )
 
@@ -1463,8 +1767,6 @@ async def finish_create_test(
 
     try:
 
-        # Recalculate statistics directly from DB
-        # so the summary is based on actual saved questions.
         stats_response = (
             supabase.table("questions")
             .select(
@@ -1478,20 +1780,20 @@ async def finish_create_test(
             .execute()
         )
 
-        actual_questions = stats_response.data or []
-
-        actual_count = len(actual_questions)
-
-        actual_total_marks = sum(
-            float(row.get("marks") or 0)
-            for row in actual_questions
+        actual_questions = (
+            stats_response.data or []
         )
 
-        # ----------------------------------------------------
-        # Keep draft status.
-        #
-        # Publishing will be a separate step later.
-        # ----------------------------------------------------
+        actual_count = len(
+            actual_questions
+        )
+
+        actual_total_marks = sum(
+            float(
+                row.get("marks") or 0
+            )
+            for row in actual_questions
+        )
 
         await message.reply_text(
             "🎉 Test creation completed!\n\n"
@@ -1506,43 +1808,53 @@ async def finish_create_test(
         )
 
     except Exception:
+
         logger.exception(
             "Failed to finalize test summary"
         )
 
         await message.reply_text(
-            "⚠️ Test was created, but I could not load the final summary.\n\n"
+            "⚠️ Test was created, but I could not load "
+            "the final summary.\n\n"
             "The draft is still saved."
         )
 
-    clear_create_test_data(context)
+    clear_create_test_data(
+        context
+    )
 
     # Return to dashboard.
-    telegram_user_id = message.from_user.id if message.from_user else None
+    telegram_user_id = (
+        message.from_user.id
+        if message.from_user
+        else None
+    )
 
     if telegram_user_id:
 
-        admin = await get_admin_by_telegram_id(
+        role = authenticated_users.get(
             telegram_user_id
         )
 
-        if admin:
+        if role == "OWNER":
 
-            if admin.get("role") == "OWNER":
-                keyboard = OWNER_DASHBOARD
-            else:
-                keyboard = ADMIN_DASHBOARD
+            await message.reply_text(
+                "🏟️ Owner Dashboard",
+                reply_markup=OWNER_DASHBOARD,
+            )
+
+        elif role == "ADMIN":
 
             await message.reply_text(
                 "🏟️ Admin Dashboard",
-                reply_markup=keyboard,
+                reply_markup=ADMIN_DASHBOARD,
             )
 
     return ConversationHandler.END
 
 
 # ============================================================
-# CREATE TEST ERROR/CANCEL COMMAND
+# CREATE TEST CANCEL COMMAND
 # ============================================================
 
 async def cancel_command(
@@ -1550,38 +1862,37 @@ async def cancel_command(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
 
-    return await cancel_create_test(
-        update,
-        context,
-    )
+    if context.user_data.get(
+        "create_test_id"
+    ):
+
+        return await cancel_create_test(
+            update,
+            context,
+        )
+
+    return ConversationHandler.END
 
 
 # ============================================================
-# DASHBOARD HANDLERS
+# DASHBOARD - MANAGE TESTS
 # ============================================================
-
-async def dashboard_create_test(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> int:
-
-    return await begin_create_test(
-        update,
-        context,
-    )
-
 
 async def dashboard_manage_tests(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
 
-    admin = await get_logged_in_admin(update)
+    role = get_authenticated_role(
+        update
+    )
 
-    if not admin:
+    if role not in ("OWNER", "ADMIN"):
+
         await update.message.reply_text(
             "⛔ Please login first."
         )
+
         return
 
     await update.message.reply_text(
@@ -1590,17 +1901,25 @@ async def dashboard_manage_tests(
     )
 
 
+# ============================================================
+# DASHBOARD - RESULTS
+# ============================================================
+
 async def dashboard_results(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
 
-    admin = await get_logged_in_admin(update)
+    role = get_authenticated_role(
+        update
+    )
 
-    if not admin:
+    if role not in ("OWNER", "ADMIN"):
+
         await update.message.reply_text(
             "⛔ Please login first."
         )
+
         return
 
     await update.message.reply_text(
@@ -1609,29 +1928,227 @@ async def dashboard_results(
     )
 
 
+# ============================================================
+# DASHBOARD - MANAGE ADMINS
+# ============================================================
+
 async def dashboard_manage_admins(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
 
-    admin = await get_logged_in_admin(update)
+    # --------------------------------------------------------
+    # BACKEND PERMISSION CHECK
+    # --------------------------------------------------------
 
-    if not admin:
+    if not is_owner(update):
+
         await update.message.reply_text(
-            "⛔ Please login first."
+            "⛔ Access Denied.\n\n"
+            "Only the Owner can manage admins."
         )
+
         return
 
-    if admin.get("role") != "OWNER":
-        await update.message.reply_text(
-            "⛔ Only the Owner can manage admins."
-        )
-        return
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "➕ Add Admin",
+                    callback_data="admin_add",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "👥 View Admins",
+                    callback_data="admin_view",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "❌ Remove Admin",
+                    callback_data="admin_remove",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ Back",
+                    callback_data="admin_back",
+                )
+            ],
+        ]
+    )
 
     await update.message.reply_text(
         "👥 Manage Admins\n\n"
-        "Admin management module will be added here next."
+        "Only the Owner can access this section.",
+        reply_markup=keyboard,
     )
+
+
+# ============================================================
+# MANAGE ADMINS CALLBACKS
+# ============================================================
+
+async def manage_admins_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    query = update.callback_query
+
+    if not query:
+        return
+
+    await query.answer()
+
+    # --------------------------------------------------------
+    # BACKEND OWNER CHECK
+    # --------------------------------------------------------
+
+    if not is_owner(update):
+
+        await query.message.reply_text(
+            "⛔ Access Denied.\n\n"
+            "Only the Owner can manage admins."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # ADD ADMIN
+    # --------------------------------------------------------
+
+    if query.data == "admin_add":
+
+        await query.message.reply_text(
+            "➕ Add Admin\n\n"
+            "Admin management is being prepared.\n\n"
+            "The admin system uses the common "
+            "ADMIN_PASSWORD from Railway.\n\n"
+            "No individual admin password is required."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # VIEW ADMINS
+    # --------------------------------------------------------
+
+    if query.data == "admin_view":
+
+        try:
+
+            response = (
+                supabase.table("admins")
+                .select(
+                    "telegram_user_id,display_name,username,"
+                    "role,is_active"
+                )
+                .eq(
+                    "is_active",
+                    True,
+                )
+                .execute()
+            )
+
+            rows = response.data or []
+
+            if not rows:
+
+                await query.message.reply_text(
+                    "👥 No active admin records found."
+                )
+
+                return
+
+            lines = [
+                "👥 Active Admin Records\n"
+            ]
+
+            for index, row in enumerate(
+                rows,
+                start=1,
+            ):
+
+                display_name = (
+                    row.get("display_name")
+                    or "Unknown"
+                )
+
+                username = (
+                    row.get("username")
+                    or "No username"
+                )
+
+                role = (
+                    row.get("role")
+                    or "OWNER"
+                )
+
+                telegram_id = (
+                    row.get("telegram_user_id")
+                    or "Unknown"
+                )
+
+                lines.append(
+                    f"{index}. {display_name}\n"
+                    f"   Role: {role}\n"
+                    f"   Username: @{username}"
+                    if username != "No username"
+                    else
+                    f"{index}. {display_name}\n"
+                    f"   Role: {role}\n"
+                    f"   Username: Not set"
+                )
+
+                lines.append(
+                    f"   Telegram ID: {telegram_id}\n"
+                )
+
+            await query.message.reply_text(
+                "\n".join(lines)
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Failed to load admin records"
+            )
+
+            await query.message.reply_text(
+                "❌ Could not load admin records."
+            )
+
+        return
+
+    # --------------------------------------------------------
+    # REMOVE ADMIN
+    # --------------------------------------------------------
+
+    if query.data == "admin_remove":
+
+        await query.message.reply_text(
+            "❌ Remove Admin\n\n"
+            "The final add/remove admin workflow will be "
+            "implemented after the login/security foundation "
+            "is verified."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # BACK
+    # --------------------------------------------------------
+
+    if query.data == "admin_back":
+
+        await query.message.reply_text(
+            "🏟️ Owner Dashboard",
+            reply_markup=OWNER_DASHBOARD,
+        )
+
+        return
 
 
 # ============================================================
@@ -1651,7 +2168,9 @@ async def dashboard_message_handler(
 
     text = update.message.text.strip()
 
-    telegram_user_id = get_telegram_user_id(update)
+    telegram_user_id = get_telegram_user_id(
+        update
+    )
 
     if telegram_user_id is None:
         return
@@ -1674,14 +2193,16 @@ async def dashboard_message_handler(
     # --------------------------------------------------------
 
     if telegram_user_id not in authenticated_users:
+
+        await update.message.reply_text(
+            "⛔ Please use /start to login."
+        )
+
         return
 
     # --------------------------------------------------------
-    # DASHBOARD BUTTONS
+    # DASHBOARD
     # --------------------------------------------------------
-
-    if text == "➕ Create Test":
-        return
 
     if text == "📋 Manage Tests":
 
@@ -1689,6 +2210,7 @@ async def dashboard_message_handler(
             update,
             context,
         )
+
         return
 
     if text == "🏆 Results":
@@ -1697,6 +2219,7 @@ async def dashboard_message_handler(
             update,
             context,
         )
+
         return
 
     if text == "👥 Manage Admins":
@@ -1705,6 +2228,7 @@ async def dashboard_message_handler(
             update,
             context,
         )
+
         return
 
     if text == "🚪 Logout":
@@ -1713,6 +2237,27 @@ async def dashboard_message_handler(
             update,
             context,
         )
+
+        return
+
+    if text == "➕ Create Test":
+
+        # Normally handled by ConversationHandler.
+        # This branch is kept as a safe fallback.
+        await begin_create_test(
+            update,
+            context,
+        )
+
+        return
+
+    if text == "❌ Cancel":
+
+        await cancel_create_test(
+            update,
+            context,
+        )
+
         return
 
     await update.message.reply_text(
@@ -1729,7 +2274,7 @@ async def error_handler(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
 
-    logger.exception(
+    logger.error(
         "Unhandled exception while processing update",
         exc_info=context.error,
     )
@@ -1746,6 +2291,7 @@ async def error_handler(
                 )
 
     except Exception:
+
         logger.exception(
             "Failed to send error message"
         )
@@ -1764,39 +2310,63 @@ def main() -> None:
     )
 
     # --------------------------------------------------------
+    # START
+    # --------------------------------------------------------
+
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start,
+        )
+    )
+
+    # --------------------------------------------------------
+    # LOGIN TYPE SELECTION
+    # --------------------------------------------------------
+
+    application.add_handler(
+        CallbackQueryHandler(
+            select_login_type,
+            pattern=r"^login_(owner|admin)$",
+        )
+    )
+
+    # --------------------------------------------------------
     # CREATE TEST CONVERSATION
-    #
-    # IMPORTANT:
-    # ConversationHandler is added before the generic
-    # dashboard message handler.
     # --------------------------------------------------------
 
     create_test_conversation = ConversationHandler(
         entry_points=[
             MessageHandler(
-                filters.Regex(r"^➕ Create Test$"),
+                filters.Regex(
+                    r"^➕ Create Test$"
+                ),
                 begin_create_test,
             )
         ],
+
         states={
 
             CREATE_TEST_NAME: [
                 MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
+                    filters.TEXT
+                    & ~filters.COMMAND,
                     receive_test_name,
                 )
             ],
 
             CREATE_TEST_DESCRIPTION: [
                 MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
+                    filters.TEXT
+                    & ~filters.COMMAND,
                     receive_test_description,
                 )
             ],
 
             QUESTION_TEXT: [
                 MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
+                    filters.TEXT
+                    & ~filters.COMMAND,
                     receive_question_text,
                 )
             ],
@@ -1810,42 +2380,48 @@ def main() -> None:
 
             OPTION_A: [
                 MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
+                    filters.TEXT
+                    & ~filters.COMMAND,
                     receive_option_a,
                 )
             ],
 
             OPTION_B: [
                 MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
+                    filters.TEXT
+                    & ~filters.COMMAND,
                     receive_option_b,
                 )
             ],
 
             OPTION_C: [
                 MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
+                    filters.TEXT
+                    & ~filters.COMMAND,
                     receive_option_c,
                 )
             ],
 
             OPTION_D: [
                 MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
+                    filters.TEXT
+                    & ~filters.COMMAND,
                     receive_option_d,
                 )
             ],
 
             QUESTION_MARKS: [
                 MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
+                    filters.TEXT
+                    & ~filters.COMMAND,
                     receive_question_marks,
                 )
             ],
 
             QUESTION_NEGATIVE_MARKS: [
                 MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
+                    filters.TEXT
+                    & ~filters.COMMAND,
                     receive_question_negative_marks,
                 )
             ],
@@ -1878,7 +2454,9 @@ def main() -> None:
                 cancel_command,
             ),
             MessageHandler(
-                filters.Regex(r"^❌ Cancel$"),
+                filters.Regex(
+                    r"^❌ Cancel$"
+                ),
                 cancel_create_test,
             ),
         ],
@@ -1886,30 +2464,19 @@ def main() -> None:
         allow_reentry=False,
     )
 
-    # --------------------------------------------------------
-    # COMMANDS
-    # --------------------------------------------------------
-
-    application.add_handler(
-        CommandHandler(
-            "start",
-            start,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "cancel",
-            cancel_command,
-        )
-    )
-
-    # --------------------------------------------------------
-    # CREATE TEST CONVERSATION
-    # --------------------------------------------------------
-
     application.add_handler(
         create_test_conversation
+    )
+
+    # --------------------------------------------------------
+    # MANAGE ADMINS CALLBACKS
+    # --------------------------------------------------------
+
+    application.add_handler(
+        CallbackQueryHandler(
+            manage_admins_callback,
+            pattern=r"^admin_(add|view|remove|back)$",
+        )
     )
 
     # --------------------------------------------------------
@@ -1918,18 +2485,21 @@ def main() -> None:
 
     application.add_handler(
         MessageHandler(
-            filters.Regex(r"^🚪 Logout$"),
+            filters.Regex(
+                r"^🚪 Logout$"
+            ),
             logout,
         )
     )
 
     # --------------------------------------------------------
-    # GENERIC DASHBOARD HANDLER
+    # GENERAL TEXT HANDLER
     # --------------------------------------------------------
 
     application.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
+            filters.TEXT
+            & ~filters.COMMAND,
             dashboard_message_handler,
         )
     )
@@ -1943,10 +2513,12 @@ def main() -> None:
     )
 
     # --------------------------------------------------------
-    # START BOT
+    # START POLLING
     # --------------------------------------------------------
 
-    logger.info("PrepArena Admin Bot starting...")
+    logger.info(
+        "PrepArena Admin Bot starting..."
+    )
 
     application.run_polling(
         allowed_updates=Update.ALL_TYPES
